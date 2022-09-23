@@ -698,7 +698,8 @@ class EnsembleSampler:
                     ncons[:] = 0
 
                 elif distribute == "walker":
-                    results = list(self.distribute(self._sample_slice, zip(X[active], Z0, directions)))
+                    f = _FunctionWrapper(_sample_slice, (self.logprob_fn, self.maxsteps, self.maxiter), None)
+                    results = list(self.distribute(f, zip(X[active], Z0, directions)))
 
                     X_prime = np.array([r["X_prime"] for r in results])
                     Z_prime = np.array([r["Z_prime"] for r in results])
@@ -757,75 +758,94 @@ class EnsembleSampler:
         if progress:
             t.close()
     
-    def _sample_slice(self, args):
-        X, Z0, direction = args
-        # Set Initial Interval Boundaries
-        L = - np.random.uniform(0.0, 1.0)
-        R = L + 1.0
+def _sample_slice(args, log_prob_func, maxsteps, maxiter):
+    X, Z0, direction = args
+    # Set Initial Interval Boundaries
+    L = - np.random.uniform(0.0, 1.0)
+    R = L + 1.0
 
-        def expand(delta, is_left):
-            n_exp = 0
-            Z_prime = Z0
-            while n_exp < self.maxsteps-1:
-                X_prime = X + direction * delta
-            
-                Z_prime, _ = self.compute_log_prob(X_prime, distribute=False)
-                Z_prime = Z_prime.squeeze()
+    def wrapped_log_prob_func(p):
+        # Check that the parameters are in physical ranges.
+        if np.any(np.isinf(p)):
+            raise ValueError("At least one parameter value was infinite")
+        if np.any(np.isnan(p)):
+            raise ValueError("At least one parameter value was NaN")
 
-                if Z_prime > Z0:
-                    n_exp += 1
-                    if is_left:
-                        delta -= 1
-                    else:
-                        delta += 1
-                    if n_exp > self.maxiter:
-                        raise RuntimeError('Number of expansions exceeded maximum limit! \n' +
-                                           'Make sure that the pdf is well-defined. \n' +
-                                           'Otherwise increase the maximum limit (maxiter=10^4 by default).')
-                else:
-                    return delta, n_exp
+        results = log_prob_func(p)
+
+        try:
+            log_prob = float(results[0])
+            blob = results[1:]
+        except (IndexError, TypeError):
+            log_prob = float(results)
+            blob = None
+
+        # Check for log_prob returning NaN.
+        if np.isnan(log_prob):
+            raise ValueError("Probability function returned NaN")
+        return log_prob, blob
+
+    def expand(delta, is_left):
+        n_exp = 0
+        Z_prime = Z0
+        while n_exp < maxsteps-1:
+            X_prime = X + direction * delta
         
-        L, n_exp_L = expand(L, is_left=True)
-        R, n_exp_R = expand(R, is_left=False)
+            Z_prime, _ = wrapped_log_prob_func(X_prime)
 
-        # Shrink
-        n_con = 0
-        while n_con < self.maxsteps:
-            u = np.random.uniform(0, 1)
-            w = L + u*(R - L)
-
-            # Calculate new position
-            X_prime = X + direction * w
-
-            # Calculate log P of new position X_prime
-            Z_prime, blobs_prime = self.compute_log_prob(X_prime, distribute=False)
-            Z_prime = Z_prime.squeeze()
-
-            if Z_prime < Z0:
-                # Outside: shrink the interval
-                n_con += 1
-                if w < 0:
-                    # X_prime is outside on the left, shrink left
-                    L = w
+            if Z_prime > Z0:
+                n_exp += 1
+                if is_left:
+                    delta -= 1
                 else:
-                    # X_prime is outside on the right, shrink right
-                    R = w
-                if n_con > self.maxiter:
-                    raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
+                    delta += 1
+                if n_exp > maxiter:
+                    raise RuntimeError('Number of expansions exceeded maximum limit! \n' +
                                         'Make sure that the pdf is well-defined. \n' +
                                         'Otherwise increase the maximum limit (maxiter=10^4 by default).')
             else:
-                break
-        
-        n_call = 3 + n_exp_L + n_exp_R + n_con
+                return delta, n_exp
+    
+    L, n_exp_L = expand(L, is_left=True)
+    R, n_exp_R = expand(R, is_left=False)
 
-        return dict(X_prime=X_prime,
-                    Z_prime=Z_prime,
-                    blobs_prime=blobs_prime,
-                    n_exp_L=n_exp_L,
-                    n_exp_R=n_exp_R,
-                    n_con=n_con,
-                    n_call=n_call)
+    # Shrink
+    n_con = 0
+    while n_con < maxsteps:
+        u = np.random.uniform(0, 1)
+        w = L + u*(R - L)
+
+        # Calculate new position
+        X_prime = X + direction * w
+
+        # Calculate log P of new position X_prime
+        Z_prime, blobs_prime = wrapped_log_prob_func(X_prime)
+
+        if Z_prime < Z0:
+            # Outside: shrink the interval
+            n_con += 1
+            if w < 0:
+                # X_prime is outside on the left, shrink left
+                L = w
+            else:
+                # X_prime is outside on the right, shrink right
+                R = w
+            if n_con > maxiter:
+                raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
+                                    'Make sure that the pdf is well-defined. \n' +
+                                    'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+        else:
+            break
+    
+    n_call = 3 + n_exp_L + n_exp_R + n_con
+
+    return dict(X_prime=X_prime,
+                Z_prime=Z_prime,
+                blobs_prime=blobs_prime,
+                n_exp_L=n_exp_L,
+                n_exp_R=n_exp_R,
+                n_con=n_con,
+                n_call=n_call)
 
 class sampler(EnsembleSampler):
     def __init__(self, *args, **kwargs):
