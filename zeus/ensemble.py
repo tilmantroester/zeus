@@ -115,6 +115,8 @@ class EnsembleSampler:
         self.tolerance = tolerance
         self.nexps = []
         self.ncons =  []
+        self.nexps_per_walker = []
+        self.ncons_per_walker = []
 
         # Set up maximum number of Expansions/Contractions
         self.maxiter = maxiter
@@ -534,6 +536,8 @@ class EnsembleSampler:
         for i in range(self.nsteps):
 
             # Initialise number of expansions & contractions
+            nexps = np.zeros(int(self.nwalkers/2), dtype=int)
+            ncons = np.zeros(int(self.nwalkers/2), dtype=int)
             nexp = 0
             ncon = 0
 
@@ -617,7 +621,7 @@ class EnsembleSampler:
                         if Z0[j] < Z_L[j]:
                             L[j] = L[j] - 1.0
                             J[j] = J[j] - 1
-                            nexp += 1
+                            nexps[j] += 1
                         else:
                             mask_J[j] = False
 
@@ -626,7 +630,7 @@ class EnsembleSampler:
                         if Z0[j] < Z_R[j]:
                             R[j] = R[j] + 1.0
                             K[j] = K[j] - 1
-                            nexp += 1
+                            nexps[j] += 1
                         else:
                             mask_K[j] = False
 
@@ -665,16 +669,25 @@ class EnsembleSampler:
                         else:
                             if Widths[j] < 0.0:
                                 L[j] = Widths[j]
-                                ncon += 1
+                                ncons[j] += 1
                             elif Widths[j] > 0.0:
                                 R[j] = Widths[j]
-                                ncon += 1
+                                ncons[j] += 1
 
                     cnt += 1
                     if cnt > self.maxiter:
                         raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
                                            'Make sure that the pdf is well-defined. \n' +
                                            'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+
+                nexp += nexps.sum()
+                ncon += ncons.sum()
+                # print(f"Expansions: min={nexps.min()}, max={nexps.max()}, mean={nexps.mean()}")
+                # print(f"Contractions: min={ncons.min()}, max={ncons.max()}, mean={ncons.mean()}")
+                self.nexps_per_walker.append(nexps.copy())
+                self.ncons_per_walker.append(ncons.copy())
+                nexps[:] = 0
+                ncons[:] = 0
 
                 # Update Positions
                 X[active] = X_prime
@@ -692,6 +705,8 @@ class EnsembleSampler:
                 self.mus.append(self.mu)
                 if np.abs(nexp / (nexp + ncon) - 0.5) < self.tolerance:
                     ncount += 1
+                else:
+                    ncount = 0
                 if ncount > self.patience:
                     self.tune = False
                     if self.light_mode:
