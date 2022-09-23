@@ -332,7 +332,7 @@ class EnsembleSampler:
             logging.info('Thinning rate: ' + str(self.thin))
     
 
-    def compute_log_prob(self, coords):
+    def compute_log_prob(self, coords, distribute=True):
         """
         Calculate the vector of log-probability for the walkers
 
@@ -354,7 +354,10 @@ class EnsembleSampler:
         if self.vectorize:
             results = self.logprob_fn(p)
         else:
-            results = list(self.distribute(self.logprob_fn, (p[i] for i in range(len(p)))))
+            if distribute:
+                results = list(self.distribute(self.logprob_fn, (p[i] for i in range(len(p)))))
+            else:
+                results = [self.logprob_fn(p)]
 
         try:
             log_prob = np.array([float(l[0]) for l in results])
@@ -395,7 +398,8 @@ class EnsembleSampler:
                  log_prob0=None,
                  blobs0=None,
                  thin_by=1,
-                 callbacks=None):
+                 callbacks=None,
+                 distribute="walker"):
         '''
         Run MCMC.
 
@@ -424,7 +428,8 @@ class EnsembleSampler:
                              iterations=nsteps,
                              thin=thin,
                              thin_by=thin_by,
-                             progress=progress):
+                             progress=progress,
+                             distribute=distribute):
 
             if callbacks is None:
                 pass
@@ -451,7 +456,8 @@ class EnsembleSampler:
             iterations=1,
             thin=1,
             thin_by=1,
-            progress=True):
+            progress=True,
+            distribute="log_p"):
         '''
         Advance the chain as a generator. The current iteration index of the generator is given by the ``sampler.iteration`` property.
 
@@ -552,7 +558,6 @@ class EnsembleSampler:
 
             # Loop over two sets
             for ensembles in sets:
-                indeces = np.arange(int(self.nwalkers/2))
                 # Define active-inactive ensembles
                 active, inactive = ensembles
 
@@ -562,132 +567,149 @@ class EnsembleSampler:
                 # Get Z0 = LogP(x0)
                 Z0 = Z[active] - np.random.exponential(size=int(self.nwalkers/2))
 
-                # Set Initial Interval Boundaries
-                L = - np.random.uniform(0.0,1.0,size=int(self.nwalkers/2))
-                R = L + 1.0
+                if distribute == "log_p":
+                    indeces = np.arange(int(self.nwalkers/2))
 
-                # Parallel stepping-out
-                J = np.floor(self.maxsteps * np.random.uniform(0.0,1.0,size=int(self.nwalkers/2)))
-                K = (self.maxsteps - 1) - J
+                    # Set Initial Interval Boundaries
+                    L = - np.random.uniform(0.0,1.0,size=int(self.nwalkers/2))
+                    R = L + 1.0
 
-                # Initialise number of Log prob calls
-                ncall = 0
+                    # Parallel stepping-out
+                    J = np.floor(self.maxsteps * np.random.uniform(0.0,1.0,size=int(self.nwalkers/2)))
+                    K = (self.maxsteps - 1) - J
 
-                # Left stepping-out initialisation
-                mask_J = np.full(int(self.nwalkers/2),True)
-                Z_L = np.empty(int(self.nwalkers/2))
-                X_L = np.empty((int(self.nwalkers/2),self.ndim))
+                    # Initialise number of Log prob calls
+                    ncall = 0
 
-                # Right stepping-out initialisation
-                mask_K = np.full(int(self.nwalkers/2),True)
-                Z_R = np.empty(int(self.nwalkers/2))
-                X_R = np.empty((int(self.nwalkers/2),self.ndim))
+                    # Left stepping-out initialisation
+                    mask_J = np.full(int(self.nwalkers/2),True)
+                    Z_L = np.empty(int(self.nwalkers/2))
+                    X_L = np.empty((int(self.nwalkers/2),self.ndim))
 
-                cnt = 0
-                # Stepping-Out procedure
-                while len(mask_J[mask_J])>0 or len(mask_K[mask_K])>0:
-                    if len(mask_J[mask_J])>0:
+                    # Right stepping-out initialisation
+                    mask_K = np.full(int(self.nwalkers/2),True)
+                    Z_R = np.empty(int(self.nwalkers/2))
+                    X_R = np.empty((int(self.nwalkers/2),self.ndim))
+
+                    cnt = 0
+                    # Stepping-Out procedure
+                    while len(mask_J[mask_J])>0 or len(mask_K[mask_K])>0:
+                        if len(mask_J[mask_J])>0:
+                            cnt += 1
+                        if len(mask_K[mask_K])>0:
+                            cnt += 1
+                        if cnt > self.maxiter:
+                            raise RuntimeError('Number of expansions exceeded maximum limit! \n' +
+                                            'Make sure that the pdf is well-defined. \n' +
+                                            'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+
+                        for j in indeces[mask_J]:
+                            if J[j] < 1:
+                                mask_J[j] = False
+
+                        for j in indeces[mask_K]:
+                            if K[j] < 1:
+                                mask_K[j] = False
+
+                        X_L[mask_J] = directions[mask_J] * L[mask_J][:,np.newaxis] + X[active][mask_J]
+                        X_R[mask_K] = directions[mask_K] * R[mask_K][:,np.newaxis] + X[active][mask_K]
+
+                        if len(X_L[mask_J]) + len(X_R[mask_K]) < 1:
+                            Z_L[mask_J] = np.array([])
+                            Z_R[mask_K] = np.array([])
+                            cnt -= 1
+                        else:
+                            Z_LR_masked, _ = self.compute_log_prob(np.concatenate([X_L[mask_J],X_R[mask_K]]))
+                            #Z_LR_masked = np.array(list(self.distribute(self.logprob_fn, np.concatenate([X_L[mask_J],X_R[mask_K]]))))
+                            Z_L[mask_J] = Z_LR_masked[:X_L[mask_J].shape[0]]
+                            Z_R[mask_K] = Z_LR_masked[X_L[mask_J].shape[0]:]
+
+                        for j in indeces[mask_J]:
+                            ncall += 1
+                            if Z0[j] < Z_L[j]:
+                                L[j] = L[j] - 1.0
+                                J[j] = J[j] - 1
+                                nexps[j] += 1
+                            else:
+                                mask_J[j] = False
+
+                        for j in indeces[mask_K]:
+                            ncall += 1
+                            if Z0[j] < Z_R[j]:
+                                R[j] = R[j] + 1.0
+                                K[j] = K[j] - 1
+                                nexps[j] += 1
+                            else:
+                                mask_K[j] = False
+
+
+                    # Shrinking procedure
+                    Widths = np.empty(int(self.nwalkers/2))
+                    Z_prime = np.empty(int(self.nwalkers/2))
+                    X_prime = np.empty((int(self.nwalkers/2),self.ndim))
+                    if blobs is not None:
+                        blobs_prime = np.empty(int(self.nwalkers/2), dtype=np.dtype((blobs[0].dtype, blobs[0].shape)))
+                    mask = np.full(int(self.nwalkers/2),True)
+
+                    cnt = 0
+                    while len(mask[mask])>0:
+                        # Update Widths of intervals
+                        Widths[mask] = L[mask] + np.random.uniform(0.0,1.0,size=len(mask[mask])) * (R[mask] - L[mask])
+
+                        # Compute New Positions
+                        X_prime[mask] = directions[mask] * Widths[mask][:,np.newaxis] + X[active][mask]
+                        
+
+                        # Calculate LogP of New Positions
+                        if blobs is None:
+                            Z_prime[mask], _ = self.compute_log_prob(X_prime[mask])
+                            #Z_prime[mask] = np.array(list(self.distribute(self.logprob_fn, X_prime[mask])))
+                        else:
+                            Z_prime[mask], blobs_prime[mask] = self.compute_log_prob(X_prime[mask])
+
+                        # Count LogProb calls
+                        ncall += len(mask[mask])
+
+                        # Shrink slices
+                        for j in indeces[mask]:
+                            if Z0[j] < Z_prime[j]:
+                                mask[j] = False
+                            else:
+                                if Widths[j] < 0.0:
+                                    L[j] = Widths[j]
+                                    ncons[j] += 1
+                                elif Widths[j] > 0.0:
+                                    R[j] = Widths[j]
+                                    ncons[j] += 1
+
                         cnt += 1
-                    if len(mask_K[mask_K])>0:
-                        cnt += 1
-                    if cnt > self.maxiter:
-                        raise RuntimeError('Number of expansions exceeded maximum limit! \n' +
-                                           'Make sure that the pdf is well-defined. \n' +
-                                           'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+                        if cnt > self.maxiter:
+                            raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
+                                            'Make sure that the pdf is well-defined. \n' +
+                                            'Otherwise increase the maximum limit (maxiter=10^4 by default).')
 
-                    for j in indeces[mask_J]:
-                        if J[j] < 1:
-                            mask_J[j] = False
+                    nexp += nexps.sum()
+                    ncon += ncons.sum()
+                    # print(f"Expansions: min={nexps.min()}, max={nexps.max()}, mean={nexps.mean()}")
+                    # print(f"Contractions: min={ncons.min()}, max={ncons.max()}, mean={ncons.mean()}")
+                    self.nexps_per_walker.append(nexps.copy())
+                    self.ncons_per_walker.append(ncons.copy())
+                    nexps[:] = 0
+                    ncons[:] = 0
 
-                    for j in indeces[mask_K]:
-                        if K[j] < 1:
-                            mask_K[j] = False
+                elif distribute == "walker":
+                    results = list(self.distribute(self._sample_slice, zip(X[active], Z0, directions)))
 
-                    X_L[mask_J] = directions[mask_J] * L[mask_J][:,np.newaxis] + X[active][mask_J]
-                    X_R[mask_K] = directions[mask_K] * R[mask_K][:,np.newaxis] + X[active][mask_K]
+                    X_prime = np.array([r["X_prime"] for r in results])
+                    Z_prime = np.array([r["Z_prime"] for r in results])
+                    if blobs is not None:
+                        blobs_prime = np.array([r["blobs_prime"] for r in results])
 
-                    if len(X_L[mask_J]) + len(X_R[mask_K]) < 1:
-                        Z_L[mask_J] = np.array([])
-                        Z_R[mask_K] = np.array([])
-                        cnt -= 1
-                    else:
-                        Z_LR_masked, _ = self.compute_log_prob(np.concatenate([X_L[mask_J],X_R[mask_K]]))
-                        #Z_LR_masked = np.array(list(self.distribute(self.logprob_fn, np.concatenate([X_L[mask_J],X_R[mask_K]]))))
-                        Z_L[mask_J] = Z_LR_masked[:X_L[mask_J].shape[0]]
-                        Z_R[mask_K] = Z_LR_masked[X_L[mask_J].shape[0]:]
-
-                    for j in indeces[mask_J]:
-                        ncall += 1
-                        if Z0[j] < Z_L[j]:
-                            L[j] = L[j] - 1.0
-                            J[j] = J[j] - 1
-                            nexps[j] += 1
-                        else:
-                            mask_J[j] = False
-
-                    for j in indeces[mask_K]:
-                        ncall += 1
-                        if Z0[j] < Z_R[j]:
-                            R[j] = R[j] + 1.0
-                            K[j] = K[j] - 1
-                            nexps[j] += 1
-                        else:
-                            mask_K[j] = False
-
-
-                # Shrinking procedure
-                Widths = np.empty(int(self.nwalkers/2))
-                Z_prime = np.empty(int(self.nwalkers/2))
-                X_prime = np.empty((int(self.nwalkers/2),self.ndim))
-                if blobs is not None:
-                    blobs_prime = np.empty(int(self.nwalkers/2), dtype=np.dtype((blobs[0].dtype, blobs[0].shape)))
-                mask = np.full(int(self.nwalkers/2),True)
-
-                cnt = 0
-                while len(mask[mask])>0:
-                    # Update Widths of intervals
-                    Widths[mask] = L[mask] + np.random.uniform(0.0,1.0,size=len(mask[mask])) * (R[mask] - L[mask])
-
-                    # Compute New Positions
-                    X_prime[mask] = directions[mask] * Widths[mask][:,np.newaxis] + X[active][mask]
-                    
-
-                    # Calculate LogP of New Positions
-                    if blobs is None:
-                        Z_prime[mask], _ = self.compute_log_prob(X_prime[mask])
-                        #Z_prime[mask] = np.array(list(self.distribute(self.logprob_fn, X_prime[mask])))
-                    else:
-                        Z_prime[mask], blobs_prime[mask] = self.compute_log_prob(X_prime[mask])
-
-                    # Count LogProb calls
-                    ncall += len(mask[mask])
-
-                    # Shrink slices
-                    for j in indeces[mask]:
-                        if Z0[j] < Z_prime[j]:
-                            mask[j] = False
-                        else:
-                            if Widths[j] < 0.0:
-                                L[j] = Widths[j]
-                                ncons[j] += 1
-                            elif Widths[j] > 0.0:
-                                R[j] = Widths[j]
-                                ncons[j] += 1
-
-                    cnt += 1
-                    if cnt > self.maxiter:
-                        raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
-                                           'Make sure that the pdf is well-defined. \n' +
-                                           'Otherwise increase the maximum limit (maxiter=10^4 by default).')
-
-                nexp += nexps.sum()
-                ncon += ncons.sum()
-                # print(f"Expansions: min={nexps.min()}, max={nexps.max()}, mean={nexps.mean()}")
-                # print(f"Contractions: min={ncons.min()}, max={ncons.max()}, mean={ncons.mean()}")
-                self.nexps_per_walker.append(nexps.copy())
-                self.ncons_per_walker.append(ncons.copy())
-                nexps[:] = 0
-                ncons[:] = 0
+                    ncall = sum([r["n_call"] for r in results])
+                    nexp += sum([r["n_exp_L"] + r["n_exp_R"] for r in results])
+                    ncon += sum([r["n_con"] for r in results])
+                    self.nexps_per_walker.append(np.array([r["n_exp_L"] + r["n_exp_R"] for r in results]))
+                    self.ncons_per_walker.append(np.array([r["n_con"] for r in results]))
 
                 # Update Positions
                 X[active] = X_prime
@@ -734,7 +756,76 @@ class EnsembleSampler:
         # Close progress bar
         if progress:
             t.close()
+    
+    def _sample_slice(self, args):
+        X, Z0, direction = args
+        # Set Initial Interval Boundaries
+        L = - np.random.uniform(0.0, 1.0)
+        R = L + 1.0
 
+        def expand(delta, is_left):
+            n_exp = 0
+            Z_prime = Z0
+            while n_exp < self.maxsteps-1:
+                X_prime = X + direction * delta
+            
+                Z_prime, _ = self.compute_log_prob(X_prime, distribute=False)
+                Z_prime = Z_prime.squeeze()
+
+                if Z_prime > Z0:
+                    n_exp += 1
+                    if is_left:
+                        delta -= 1
+                    else:
+                        delta += 1
+                    if n_exp > self.maxiter:
+                        raise RuntimeError('Number of expansions exceeded maximum limit! \n' +
+                                           'Make sure that the pdf is well-defined. \n' +
+                                           'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+                else:
+                    return delta, n_exp
+        
+        L, n_exp_L = expand(L, is_left=True)
+        R, n_exp_R = expand(R, is_left=False)
+
+        # Shrink
+        n_con = 0
+        while n_con < self.maxsteps:
+            u = np.random.uniform(0, 1)
+            w = L + u*(R - L)
+
+            # Calculate new position
+            X_prime = X + direction * w
+
+            # Calculate log P of new position X_prime
+            Z_prime, blobs_prime = self.compute_log_prob(X_prime, distribute=False)
+            Z_prime = Z_prime.squeeze()
+
+            if Z_prime < Z0:
+                # Outside: shrink the interval
+                n_con += 1
+                if w < 0:
+                    # X_prime is outside on the left, shrink left
+                    L = w
+                else:
+                    # X_prime is outside on the right, shrink right
+                    R = w
+                if n_con > self.maxiter:
+                    raise RuntimeError('Number of contractions exceeded maximum limit! \n' +
+                                        'Make sure that the pdf is well-defined. \n' +
+                                        'Otherwise increase the maximum limit (maxiter=10^4 by default).')
+            else:
+                break
+        
+        n_call = 3 + n_exp_L + n_exp_R + n_con
+
+        return dict(X_prime=X_prime,
+                    Z_prime=Z_prime,
+                    blobs_prime=blobs_prime,
+                    n_exp_L=n_exp_L,
+                    n_exp_R=n_exp_R,
+                    n_con=n_con,
+                    n_call=n_call)
 
 class sampler(EnsembleSampler):
     def __init__(self, *args, **kwargs):
