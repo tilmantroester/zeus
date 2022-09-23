@@ -704,7 +704,7 @@ class EnsembleSampler:
                     X_prime = np.array([r["X_prime"] for r in results])
                     Z_prime = np.array([r["Z_prime"] for r in results])
                     if blobs is not None:
-                        blobs_prime = np.array([r["blobs_prime"] for r in results])
+                        blobs_prime = np.array([r["blobs_prime"] for r in results]).squeeze()
 
                     ncall = sum([r["n_call"] for r in results])
                     nexp += sum([r["n_exp_L"] + r["n_exp_R"] for r in results])
@@ -773,11 +773,11 @@ def _sample_slice(args, log_prob_func, maxsteps, maxiter):
 
         results = log_prob_func(p)
 
-        try:
-            log_prob = float(results[0])
+        if len(results) > 1:
+            log_prob = results[0]
             blob = results[1:]
-        except (IndexError, TypeError):
-            log_prob = float(results)
+        else:
+            log_prob = results
             blob = None
 
         # Check for log_prob returning NaN.
